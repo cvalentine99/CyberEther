@@ -1,11 +1,13 @@
 #ifndef JETSTREAM_MEMORY_TYPES_HH
 #define JETSTREAM_MEMORY_TYPES_HH
 
-#include <map>
-#include <vector>
+#include <algorithm>
 #include <complex>
-#include <unordered_map>
+#include <cctype>
 #include <functional>
+#include <map>
+#include <unordered_map>
+#include <vector>
 
 #include "jetstream/logger.hh"
 #include "jetstream/macros.hh"
@@ -291,7 +293,9 @@ inline const char* GetDevicePrettyName(const Device& device) {
 
 inline Device StringToDevice(const std::string& device) {
     std::string device_l = device;
-    std::transform(device_l.begin(), device_l.end(), device_l.begin(), ::tolower);
+    std::transform(device_l.begin(), device_l.end(), device_l.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     static const std::unordered_map<std::string, Device> deviceNames = {
         {"none",   Device::None},
         {"cpu",    Device::CPU},

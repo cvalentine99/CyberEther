@@ -1,6 +1,9 @@
 #ifndef JETSTREAM_VIEWPORT_TYPES_HH
 #define JETSTREAM_VIEWPORT_TYPES_HH
 
+#include <algorithm>
+#include <cctype>
+
 #include "jetstream/types.hh"
 
 namespace Jetstream::Viewport {
@@ -33,7 +36,9 @@ inline std::string VideoCodecToString(const VideoCodec& codec) {
 
 inline VideoCodec StringToVideoCodec(const std::string& codec) {
     std::string codec_l = codec;
-    std::transform(codec_l.begin(), codec_l.end(), codec_l.begin(), ::tolower);
+    std::transform(codec_l.begin(), codec_l.end(), codec_l.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
 
     if (codec_l == "av1") {
         return VideoCodec::AV1;
