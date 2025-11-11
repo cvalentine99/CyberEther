@@ -1,5 +1,8 @@
 #include "jetstream/store.hh"
 
+#include <algorithm>
+#include <cctype>
+
 #include "jetstream/blocks/base.hh"
 #include "jetstream/modules/base.hh"
 #include "jetstream/render/base.hh"
@@ -8,6 +11,16 @@
 
 #include "flowgraphs/manifest.hh"
 #include "jetstream/blocks/manifest.hh"
+
+namespace {
+
+void ToLowerInPlace(std::string& value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+}
+
+}  // namespace
 
 namespace Jetstream {
 
@@ -33,17 +46,17 @@ Result Store::_blockList(const std::string& filter) {
     blockFilteredMetadataList.clear();
 
     std::string filterLower = filter;
-    std::transform(filterLower.begin(), filterLower.end(), filterLower.begin(), ::tolower);
+    ToLowerInPlace(filterLower);
 
     for (const auto& [key, value] : blockMetadataList) {
         std::string titleLower = value.title;
-        std::transform(titleLower.begin(), titleLower.end(), titleLower.begin(), ::tolower);
+        ToLowerInPlace(titleLower);
 
         std::string smallLower = value.summary;
-        std::transform(smallLower.begin(), smallLower.end(), smallLower.begin(), ::tolower);
+        ToLowerInPlace(smallLower);
 
         std::string detailedLower = value.description;
-        std::transform(detailedLower.begin(), detailedLower.end(), detailedLower.begin(), ::tolower);
+        ToLowerInPlace(detailedLower);
 
         // Case-insensitive search.
         if (titleLower.find(filterLower) != std::string::npos ||
@@ -69,14 +82,14 @@ Result Store::_flowgraphList(const std::string& filter) {
     filteredFlowgraphMetadataList.clear();
 
     std::string filterLower = filter;
-    std::transform(filterLower.begin(), filterLower.end(), filterLower.begin(), ::tolower);
+    ToLowerInPlace(filterLower);
 
     for (const auto& [key, value] : flowgraphMetadataList) {
         std::string titleLower = value.title;
-        std::transform(titleLower.begin(), titleLower.end(), titleLower.begin(), ::tolower);
+        ToLowerInPlace(titleLower);
 
         std::string descriptionLower = value.description;
-        std::transform(descriptionLower.begin(), descriptionLower.end(), descriptionLower.begin(), ::tolower);
+        ToLowerInPlace(descriptionLower);
 
         // Case-insensitive search.
         if (titleLower.find(filterLower) != std::string::npos ||

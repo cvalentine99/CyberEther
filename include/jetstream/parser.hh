@@ -1,17 +1,18 @@
 #ifndef JETSTREAM_PARSER_HH
 #define JETSTREAM_PARSER_HH
 
-#include <string>
-#include <vector>
-#include <memory>
-#include <functional>
 #include <algorithm>
-#include <numeric>
-#include <iterator>
-#include <sstream>
+#include <cctype>
+#include <functional>
 #include <iostream>
+#include <iterator>
+#include <memory>
+#include <numeric>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "jetstream/types.hh"
 #include "jetstream/macros.hh"
@@ -212,7 +213,9 @@ class Parser {
 
             if (anyVar.type() == typeid(std::string)) {
                 std::string lower_s = std::any_cast<std::string>(anyVar);
-                std::transform(lower_s.begin(), lower_s.end(), lower_s.begin(), ::tolower);
+                std::transform(lower_s.begin(), lower_s.end(), lower_s.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
                 variable = std::move(lower_s == "true" || lower_s == "1");
                 return Result::SUCCESS;
             }
