@@ -1,8 +1,11 @@
 #ifndef JETSTREAM_BACKEND_DEVICE_VULKAN_HH
 #define JETSTREAM_BACKEND_DEVICE_VULKAN_HH
 
+#include <atomic>
+#include <chrono>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -28,6 +31,7 @@
 #endif
 
 #include "jetstream/backend/config.hh"
+#include "jetstream/backend/telemetry.hh"
 
 namespace Jetstream::Backend {
 
@@ -142,14 +146,27 @@ class Vulkan {
         bool hasUnifiedMemory;
         U64 physicalMemory;
         U64 totalProcessorCount;
-        bool lowPowerStatus;
-        U64 getThermalState;
+        std::atomic<bool> lowPowerStatus;
+        std::atomic<U64> getThermalState;
         bool canImportDeviceMemory;
         bool canImportHostMemory;
         bool canExportDeviceMemory;
+        Telemetry::Provider telemetryProviderType = Telemetry::Provider::NONE;
+        std::string telemetryProviderName;
+        void* telemetryHandle = nullptr;
+        void* telemetryContext = nullptr;
+        PFN_vkGetPhysicalDeviceToolPropertiesEXT toolingInfoFn = nullptr;
+        bool telemetryLibraryInitialized = false;
     } cache;
 
     VkDebugReportCallbackEXT debugReportCallback{};
+
+    struct {
+        std::atomic<bool> running{false};
+        std::atomic<bool> providerErrorLogged{false};
+        std::chrono::milliseconds interval{std::chrono::milliseconds(1000)};
+        std::thread worker;
+    } telemetryRuntime;
     
     std::set<std::string> getRequiredInstanceExtensions();
     std::set<std::string> getOptionalInstanceExtensions();
@@ -160,10 +177,18 @@ class Vulkan {
 
     std::set<std::string> getRequiredDeviceExtensions();
     std::set<std::string> getOptionalDeviceExtensions();
-    std::set<std::string> checkDeviceExtensionSupport(const VkPhysicalDevice& device, 
+    std::set<std::string> checkDeviceExtensionSupport(const VkPhysicalDevice& device,
                                                       const std::set<std::string>& extensions);
 
     bool isDeviceSuitable(const VkPhysicalDevice& device);
+
+    void initializeTelemetry();
+    bool setupNvmlTelemetry();
+    void updateTelemetryFromNvml();
+    void updateTelemetryFromToolingInfo();
+    void startTelemetryPolling();
+    void stopTelemetryPolling();
+    void pollTelemetry();
 };
 
 }  // namespace Jetstream::Backend

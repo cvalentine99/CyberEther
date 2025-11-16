@@ -1,11 +1,13 @@
 #ifndef JETSTREAM_BACKEND_DEVICE_WEBGPU_HH
 #define JETSTREAM_BACKEND_DEVICE_WEBGPU_HH
 
-#include <set>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <set>
+#include <string>
 
 #include <emscripten.h>
 #include <emscripten/html5.h>
@@ -13,12 +15,14 @@
 #include <emscripten/html5_webgpu.h>
 
 #include "jetstream/backend/config.hh"
+#include "jetstream/backend/telemetry.hh"
 
 namespace Jetstream::Backend {
 
 class WebGPU {
  public:
     explicit WebGPU(const Config& config);
+    ~WebGPU();
 
     std::string getDeviceName() const;
     std::string getApiVersion() const;
@@ -51,9 +55,19 @@ class WebGPU {
         bool hasUnifiedMemory;
         U64 physicalMemory;
         U64 totalProcessorCount;
-        bool lowPowerStatus;
-        U64 getThermalState;
+        std::atomic<bool> lowPowerStatus;
+        std::atomic<U64> getThermalState;
+        Telemetry::Provider telemetryProviderType = Telemetry::Provider::NONE;
+        std::string telemetryProviderName;
     } cache;
+
+    bool telemetryActive = false;
+    bool lowPowerWarningLogged = false;
+    bool thermalWarningLogged = false;
+
+    void scheduleTelemetryRefresh();
+    static void TelemetryPump(void* userData);
+    void refreshTelemetry();
 };
 
 }  // namespace Jetstream::Backend

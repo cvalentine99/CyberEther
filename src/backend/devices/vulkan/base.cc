@@ -2,6 +2,21 @@
 
 #include "jetstream/backend/devices/vulkan/base.hh"
 #include "jetstream/backend/devices/vulkan/helpers.hh"
+#include "jetstream/backend/telemetry.hh"
+
+#include <chrono>
+#include <thread>
+
+#if defined(__has_include)
+#  if __has_include(<nvml.h>)
+#    define JST_BACKEND_HAS_NVML 1
+#    include <nvml.h>
+#  endif
+#endif
+
+#ifndef JST_BACKEND_HAS_NVML
+#define JST_BACKEND_HAS_NVML 0
+#endif
 
 namespace Jetstream::Backend {
 
@@ -56,6 +71,10 @@ std::set<std::string> Vulkan::getOptionalInstanceExtensions() {
 
 #if defined(VK_KHR_portability_enumeration)
     extensions.insert(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
+
+#if defined(VK_EXT_tooling_info)
+    extensions.insert(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
 #endif
 
     return extensions;
@@ -344,8 +363,9 @@ Vulkan::Vulkan(const Config& _config) : config(_config), cache({}) {
 
     cache.deviceName = properties.deviceName;
     cache.totalProcessorCount = std::thread::hardware_concurrency();
-    cache.getThermalState = 0;  // TODO: Wire implementation.
-    cache.lowPowerStatus = false;  // TODO: Wire implementation.
+    cache.getThermalState.store(0);
+    cache.lowPowerStatus.store(false);
+    cache.telemetryProviderName = "Unavailable";
 
     {
         uint32_t major = VK_VERSION_MAJOR(properties.apiVersion);
@@ -394,6 +414,8 @@ Vulkan::Vulkan(const Config& _config) : config(_config), cache({}) {
     cache.canImportDeviceMemory = supportedDeviceExtensions.contains(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     cache.canExportDeviceMemory = supportedDeviceExtensions.contains(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     cache.canImportHostMemory = supportedDeviceExtensions.contains(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+
+    initializeTelemetry();
 
     // Create logical device.
 
@@ -603,7 +625,200 @@ Vulkan::Vulkan(const Config& _config) : config(_config), cache({}) {
     JST_INFO("-----------------------------------------------------");
 }
 
+void Vulkan::initializeTelemetry() {
+    cache.telemetryProviderType = Telemetry::Provider::NONE;
+    cache.telemetryProviderName = "Unavailable";
+    cache.telemetryHandle = nullptr;
+    cache.telemetryContext = nullptr;
+    cache.telemetryLibraryInitialized = false;
+    cache.toolingInfoFn = nullptr;
+
+    bool telemetryReady = false;
+
+#if JST_BACKEND_HAS_NVML
+    if (properties.vendorID == 0x10DE) {
+        telemetryReady = setupNvmlTelemetry();
+    }
+#endif
+
+    if (!telemetryReady && supportedInstanceExtensions.contains(VK_EXT_TOOLING_INFO_EXTENSION_NAME)) {
+        auto toolingFn = reinterpret_cast<PFN_vkGetPhysicalDeviceToolPropertiesEXT>(
+                vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceToolPropertiesEXT"));
+        if (toolingFn != nullptr) {
+            cache.telemetryProviderType = Telemetry::Provider::TOOLING_INFO;
+            cache.telemetryProviderName = "VK_EXT_tooling_info";
+            cache.telemetryHandle = physicalDevice;
+            cache.telemetryContext = nullptr;
+            cache.toolingInfoFn = toolingFn;
+            telemetryReady = true;
+        }
+    }
+
+    if (!telemetryReady) {
+        JST_WARN("[VULKAN] Telemetry data is unavailable for '{}'.", cache.deviceName);
+        return;
+    }
+
+    pollTelemetry();
+    startTelemetryPolling();
+    JST_INFO("[VULKAN] Telemetry provider: {}", cache.telemetryProviderName);
+}
+
+bool Vulkan::setupNvmlTelemetry() {
+#if JST_BACKEND_HAS_NVML
+    const nvmlReturn_t initStatus = nvmlInit_v2();
+    if (initStatus != NVML_SUCCESS) {
+        JST_ERROR("[VULKAN] NVML initialization failed: {}", nvmlErrorString(initStatus));
+        return false;
+    }
+
+    nvmlDevice_t deviceHandle{};
+    const auto nvmlStatus = nvmlDeviceGetHandleByIndex(static_cast<unsigned int>(config.deviceId), &deviceHandle);
+    if (nvmlStatus != NVML_SUCCESS) {
+        JST_ERROR("[VULKAN] NVML cannot access device {}: {}", config.deviceId, nvmlErrorString(nvmlStatus));
+        nvmlShutdown();
+        return false;
+    }
+
+    cache.telemetryProviderType = Telemetry::Provider::NVML;
+    cache.telemetryProviderName = "NVML";
+    cache.telemetryHandle = reinterpret_cast<void*>(deviceHandle);
+    cache.telemetryLibraryInitialized = true;
+    cache.toolingInfoFn = nullptr;
+
+    return true;
+#else
+    return false;
+#endif
+}
+
+void Vulkan::startTelemetryPolling() {
+    if (telemetryRuntime.running.load()) {
+        return;
+    }
+
+    telemetryRuntime.running.store(true);
+    telemetryRuntime.providerErrorLogged.store(false);
+    telemetryRuntime.worker = std::thread([this] {
+        while (telemetryRuntime.running.load()) {
+            pollTelemetry();
+            std::this_thread::sleep_for(telemetryRuntime.interval);
+        }
+    });
+}
+
+void Vulkan::stopTelemetryPolling() {
+    const bool wasRunning = telemetryRuntime.running.exchange(false);
+    if (wasRunning && telemetryRuntime.worker.joinable()) {
+        telemetryRuntime.worker.join();
+    }
+}
+
+void Vulkan::pollTelemetry() {
+    switch (cache.telemetryProviderType) {
+        case Telemetry::Provider::NVML:
+            updateTelemetryFromNvml();
+            break;
+        case Telemetry::Provider::TOOLING_INFO:
+            updateTelemetryFromToolingInfo();
+            break;
+        default:
+            break;
+    }
+}
+
+void Vulkan::updateTelemetryFromNvml() {
+#if JST_BACKEND_HAS_NVML
+    auto deviceHandle = reinterpret_cast<nvmlDevice_t>(cache.telemetryHandle);
+    if (deviceHandle == nullptr) {
+        return;
+    }
+
+    nvmlPstates_t powerState{};
+    const nvmlReturn_t powerStateStatus = nvmlDeviceGetPowerState(deviceHandle, &powerState);
+    if (powerStateStatus == NVML_SUCCESS) {
+        cache.lowPowerStatus.store(Telemetry::IsLowPowerFromPState(static_cast<U32>(powerState)));
+    } else if (!telemetryRuntime.providerErrorLogged.load()) {
+        JST_WARN("[VULKAN] Failed to query NVML power state: {}", nvmlErrorString(powerStateStatus));
+        telemetryRuntime.providerErrorLogged.store(true);
+    }
+
+    unsigned int temperature = 0;
+    const nvmlReturn_t temperatureStatus = nvmlDeviceGetTemperature(deviceHandle, NVML_TEMPERATURE_GPU, &temperature);
+    if (temperatureStatus == NVML_SUCCESS) {
+        cache.getThermalState.store(Telemetry::ThermalBucketFromCelsius(temperature));
+    } else if (!telemetryRuntime.providerErrorLogged.load()) {
+        JST_WARN("[VULKAN] Failed to query NVML temperature: {}", nvmlErrorString(temperatureStatus));
+        telemetryRuntime.providerErrorLogged.store(true);
+    }
+
+    unsigned int powerUsageMw = 0;
+    unsigned int powerBudgetMw = 0;
+    const auto usageStatus = nvmlDeviceGetPowerUsage(deviceHandle, &powerUsageMw);
+    const auto budgetStatus = nvmlDeviceGetEnforcedPowerLimit(deviceHandle, &powerBudgetMw);
+    if (usageStatus == NVML_SUCCESS && budgetStatus == NVML_SUCCESS) {
+        const bool lowPower = Telemetry::IsLowPowerFromPowerBudget(powerUsageMw, powerBudgetMw);
+        cache.lowPowerStatus.store(lowPower);
+    } else if (!telemetryRuntime.providerErrorLogged.load()) {
+        const auto failedStatus = usageStatus != NVML_SUCCESS ? usageStatus : budgetStatus;
+        JST_WARN("[VULKAN] Failed to query NVML power budget: {}", nvmlErrorString(failedStatus));
+        telemetryRuntime.providerErrorLogged.store(true);
+    }
+#endif
+}
+
+void Vulkan::updateTelemetryFromToolingInfo() {
+    if (cache.toolingInfoFn == nullptr) {
+        return;
+    }
+
+    uint32_t toolCount = 0;
+    const VkResult countResult = cache.toolingInfoFn(physicalDevice, &toolCount, nullptr);
+    if (countResult != VK_SUCCESS) {
+        if (!telemetryRuntime.providerErrorLogged.load()) {
+            JST_WARN("[VULKAN] vkGetPhysicalDeviceToolPropertiesEXT count failed: {}", countResult);
+            telemetryRuntime.providerErrorLogged.store(true);
+        }
+        return;
+    }
+
+    std::vector<VkPhysicalDeviceToolPropertiesEXT> tools(toolCount);
+    for (auto& tool : tools) {
+        tool.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES_EXT;
+        tool.pNext = nullptr;
+    }
+
+    const VkResult toolsResult = cache.toolingInfoFn(physicalDevice, &toolCount, tools.data());
+    if (toolsResult != VK_SUCCESS) {
+        if (!telemetryRuntime.providerErrorLogged.load()) {
+            JST_WARN("[VULKAN] vkGetPhysicalDeviceToolPropertiesEXT failed: {}", toolsResult);
+            telemetryRuntime.providerErrorLogged.store(true);
+        }
+        return;
+    }
+
+    bool monitoringToolPresent = false;
+    for (const auto& tool : tools) {
+        if (tool.purposes & VK_TOOL_PURPOSE_MONITORING_BIT_EXT) {
+            monitoringToolPresent = true;
+            break;
+        }
+    }
+
+    cache.lowPowerStatus.store(!monitoringToolPresent);
+    cache.getThermalState.store(monitoringToolPresent ? 1 : 0);
+}
+
 Vulkan::~Vulkan() {
+    stopTelemetryPolling();
+
+#if JST_BACKEND_HAS_NVML
+    if (cache.telemetryProviderType == Telemetry::Provider::NVML && cache.telemetryLibraryInitialized) {
+        nvmlShutdown();
+        cache.telemetryLibraryInitialized = false;
+    }
+#endif
+
     vkDestroyFence(device, defaultFence, nullptr);
     vkFreeCommandBuffers(device, defaultCommandPool, 1, &defaultCommandBuffer);
     vkDestroyCommandPool(device, defaultCommandPool, nullptr);
@@ -677,13 +892,11 @@ U64 Vulkan::getTotalProcessorCount() const {
 }
 
 bool Vulkan::getLowPowerStatus() const {
-    // TODO: Pool power status periodically.
-    return cache.lowPowerStatus;
+    return cache.lowPowerStatus.load();
 }
 
 U64 Vulkan::getThermalState() const {
-    // TODO: Pool thermal state periodically.
-    return cache.getThermalState;
+    return cache.getThermalState.load();
 }
 
 }  // namespace Jetstream::Backend
