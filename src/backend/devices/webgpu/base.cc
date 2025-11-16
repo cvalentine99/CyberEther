@@ -2,6 +2,38 @@
 
 #include "jetstream/backend/devices/webgpu/base.hh"
 
+EM_JS(int, jetstream_webgpu_query_low_power_hint, (), {
+    if (typeof navigator !== 'undefined') {
+        if (navigator.deviceMemory !== undefined) {
+            return navigator.deviceMemory <= 4 ? 1 : 0;
+        }
+        if (navigator.hardwareConcurrency !== undefined) {
+            return navigator.hardwareConcurrency <= 4 ? 1 : 0;
+        }
+    }
+    return -1;
+});
+
+EM_JS(int, jetstream_webgpu_query_thermal_bucket, (), {
+    if (typeof performance !== 'undefined' && performance.memory) {
+        var limit = performance.memory.jsHeapSizeLimit || 0;
+        if (limit > 0) {
+            var ratio = performance.memory.usedJSHeapSize / limit;
+            if (ratio > 0.9) return 3;
+            if (ratio > 0.75) return 2;
+            if (ratio > 0.5) return 1;
+            return 0;
+        }
+    }
+    if (typeof navigator !== 'undefined' && navigator.deviceMemory !== undefined) {
+        var memoryHint = navigator.deviceMemory;
+        if (memoryHint <= 4) return 2;
+        if (memoryHint <= 8) return 1;
+        return 0;
+    }
+    return -1;
+});
+
 namespace Jetstream::Backend {
 
 static void WebGPUErrorCallback(WGPUErrorType error_type, const char* message, void*) {
@@ -29,6 +61,13 @@ WebGPU::WebGPU(const Config& _config) : config(_config), cache({}) {
 
     device.SetUncapturedErrorCallback(&WebGPUErrorCallback, nullptr);
 
+    cache.lowPowerStatus.store(false);
+    cache.getThermalState.store(0);
+    cache.telemetryProviderType = Telemetry::Provider::BROWSER;
+    cache.telemetryProviderName = "Navigator";
+    telemetryActive = true;
+    scheduleTelemetryRefresh();
+
     // Print device information.
 
     JST_WARN("Due to current Emscripten limitations the device values are inaccurate.");
@@ -43,6 +82,10 @@ WebGPU::WebGPU(const Config& _config) : config(_config), cache({}) {
     JST_INFO("Device Memory:   {:.2f} GB", static_cast<F32>(getPhysicalMemory()) / (1024*1024*1024));
     JST_INFO("Staging Buffer:  {:.2f} MB", static_cast<F32>(config.stagingBufferSize) / JST_MB);
     JST_INFO("-----------------------------------------------------");
+}
+
+WebGPU::~WebGPU() {
+    telemetryActive = false;
 }
 
 std::string WebGPU::getDeviceName() const {
@@ -70,13 +113,45 @@ U64 WebGPU::getTotalProcessorCount() const {
 }
 
 bool WebGPU::getLowPowerStatus() const {
-    // TODO: Pool power status periodically.
-    return cache.lowPowerStatus;
+    return cache.lowPowerStatus.load();
 }
 
 U64 WebGPU::getThermalState() const {
-    // TODO: Pool thermal state periodically.
-    return cache.getThermalState;
+    return cache.getThermalState.load();
+}
+
+void WebGPU::scheduleTelemetryRefresh() {
+    if (!telemetryActive) {
+        return;
+    }
+    emscripten_async_call(&WebGPU::TelemetryPump, this, 1000);
+}
+
+void WebGPU::TelemetryPump(void* userData) {
+    auto* self = reinterpret_cast<WebGPU*>(userData);
+    if (self == nullptr || !self->telemetryActive) {
+        return;
+    }
+    self->refreshTelemetry();
+    self->scheduleTelemetryRefresh();
+}
+
+void WebGPU::refreshTelemetry() {
+    const int lowPowerHint = jetstream_webgpu_query_low_power_hint();
+    if (lowPowerHint >= 0) {
+        cache.lowPowerStatus.store(lowPowerHint == 1);
+    } else if (!lowPowerWarningLogged) {
+        JST_WARN("[WebGPU] Browser telemetry does not expose power hints.");
+        lowPowerWarningLogged = true;
+    }
+
+    const int thermalBucket = jetstream_webgpu_query_thermal_bucket();
+    if (thermalBucket >= 0) {
+        cache.getThermalState.store(static_cast<U64>(thermalBucket));
+    } else if (!thermalWarningLogged) {
+        JST_WARN("[WebGPU] Browser telemetry does not expose thermal hints.");
+        thermalWarningLogged = true;
+    }
 }
 
 }  // namespace Jetstream::Backend
